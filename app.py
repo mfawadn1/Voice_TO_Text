@@ -1,329 +1,252 @@
-"""
-Voice-Text Converter App
-A Streamlit application for bidirectional audio-text conversion using Hugging Face models.
-Supports Voice-to-Text (Speech-to-Text) and Text-to-Voice (Text-to-Speech).
-"""
-
 import streamlit as st
 import torch
-import torchaudio
+from transformers import pipeline, AutoProcessor, AutoModelForTextToWaveform
 import soundfile as sf
-import librosa
 import numpy as np
-import tempfile
-import os
-from transformers import (
-    AutoModelForSpeechSeq2Seq,
-    AutoProcessor,
-    pipeline,
-    SpeechT5Processor,
-    SpeechT5ForTextToSpeech,
-    SpeechT5HifiGan
+from io import BytesIO
+import time
+from audio_recorder_streamlit import audio_recorder
+
+# Page configuration
+st.set_page_config(
+    page_title="Voice-to-Text & Text-to-Voice",
+    page_icon="🎙️",
+    layout="wide"
 )
-from datasets import load_dataset
 
-# ===========================
-# Configuration
-# ===========================
-MAX_AUDIO_SIZE_MB = 10
-MAX_TEXT_LENGTH = 1000
-SAMPLE_RATE = 16000
-
-# ===========================
-# Model Loading Functions
-# ===========================
+# Initialize session state
+if 'transcribed_text' not in st.session_state:
+    st.session_state.transcribed_text = ""
+if 'generated_audio' not in st.session_state:
+    st.session_state.generated_audio = None
+if 'recorded_audio' not in st.session_state:
+    st.session_state.recorded_audio = None
 
 @st.cache_resource
-def load_stt_model():
-    """
-    Load Speech-to-Text model (Whisper Tiny) with caching.
-    Returns a Hugging Face pipeline for automatic speech recognition.
-    """
+def load_speech_to_text_model():
+    """Load and cache the Whisper model for speech-to-text."""
     try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        
-        model_id = "openai/whisper-tiny"
-        
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_id,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-            use_safetensors=True
-        )
-        model.to(device)
-        
-        processor = AutoProcessor.from_pretrained(model_id)
-        
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            max_new_tokens=128,
-            torch_dtype=torch_dtype,
-            device=device,
-        )
-        
+        with st.spinner("Loading speech-to-text model (first time only)..."):
+            # Using Whisper tiny for faster performance
+            pipe = pipeline(
+                "automatic-speech-recognition",
+                model="openai/whisper-tiny",
+                device=-1  # CPU only
+            )
         return pipe
     except Exception as e:
-        st.error(f"Failed to load Speech-to-Text model: {str(e)}")
-        st.info("Please check your internet connection and try again.")
+        st.error(f"Error loading speech-to-text model: {e}")
         return None
-
 
 @st.cache_resource
-def load_tts_model():
-    """
-    Load Text-to-Speech model (SpeechT5) with vocoder and caching.
-    Returns processor, model, and vocoder for speech synthesis.
-    """
+def load_text_to_speech_model():
+    """Load and cache the TTS model for text-to-speech."""
     try:
-        processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
-        model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts")
-        vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan")
-        
-        # Load speaker embeddings from a dataset
-        embeddings_dataset = load_dataset("Matthijs/cmu-arctic-xvectors", split="validation")
-        speaker_embeddings = torch.tensor(embeddings_dataset[7306]["xvector"]).unsqueeze(0)
-        
-        return processor, model, vocoder, speaker_embeddings
+        with st.spinner("Loading text-to-speech model (first time only)..."):
+            # Using Facebook's MMS TTS model
+            processor = AutoProcessor.from_pretrained("facebook/mms-tts-eng")
+            model = AutoModelForTextToWaveform.from_pretrained("facebook/mms-tts-eng")
+        return processor, model
     except Exception as e:
-        st.error(f"Failed to load Text-to-Speech model: {str(e)}")
-        st.info("Please check your internet connection and try again.")
-        return None, None, None, None
-
-
-# ===========================
-# Audio Processing Functions
-# ===========================
-
-def process_audio_file(audio_file):
-    """
-    Process uploaded audio file and resample to 16kHz if needed.
-    Returns audio array and sample rate.
-    """
-    try:
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
-            tmp_file.write(audio_file.read())
-            tmp_path = tmp_file.name
-        
-        # Load audio using librosa (handles multiple formats)
-        audio, sr = librosa.load(tmp_path, sr=SAMPLE_RATE)
-        
-        # Clean up temporary file
-        os.unlink(tmp_path)
-        
-        return audio, sr
-    except Exception as e:
-        st.error(f"Error processing audio file: {str(e)}")
+        st.error(f"Error loading text-to-speech model: {e}")
         return None, None
 
-
-def transcribe_audio(audio_file, pipe):
-    """
-    Transcribe audio file to text using the STT pipeline.
-    Returns transcribed text.
-    """
+def transcribe_audio(audio_bytes, stt_model):
+    """Transcribe audio bytes to text."""
     try:
-        # Process audio file
-        audio, sr = process_audio_file(audio_file)
-        if audio is None:
-            return None
+        start_time = time.time()
         
-        # Perform transcription
+        # Save audio to temporary bytes
         with st.spinner("Transcribing audio..."):
-            result = pipe(audio)
-            transcribed_text = result["text"]
+            # The audio_recorder returns WAV format
+            result = stt_model(audio_bytes)
+            transcription = result["text"]
         
-        return transcribed_text
+        elapsed_time = time.time() - start_time
+        st.success(f"Transcription complete! (Time: {elapsed_time:.2f}s)")
+        
+        return transcription
     except Exception as e:
-        st.error(f"Transcription failed: {str(e)}")
+        st.error(f"Transcription error: {e}")
         return None
 
-
-def generate_tts(text, processor, model, vocoder, speaker_embeddings):
-    """
-    Generate speech from text using the TTS model.
-    Returns path to generated audio file.
-    """
+def generate_speech(text, processor, model):
+    """Generate speech from text."""
     try:
-        # Process text input
-        inputs = processor(text=text, return_tensors="pt")
+        start_time = time.time()
         
-        # Generate speech
-        with st.spinner("Generating audio..."):
+        with st.spinner("Generating speech..."):
+            # Process text
+            inputs = processor(text=text, return_tensors="pt")
+            
+            # Generate speech
             with torch.no_grad():
-                speech = model.generate_speech(
-                    inputs["input_ids"],
-                    speaker_embeddings,
-                    vocoder=vocoder
-                )
+                output = model(**inputs).waveform
+            
+            # Convert to numpy array
+            audio_data = output.squeeze().cpu().numpy()
+            
+            # Normalize audio
+            audio_data = audio_data / np.max(np.abs(audio_data))
+            
+        elapsed_time = time.time() - start_time
+        st.success(f"Speech generation complete! (Time: {elapsed_time:.2f}s)")
         
-        # Save audio to temporary file
-        output_path = tempfile.mktemp(suffix=".wav")
-        sf.write(output_path, speech.numpy(), samplerate=16000)
-        
-        return output_path
+        return audio_data, model.config.sampling_rate
     except Exception as e:
-        st.error(f"Audio generation failed: {str(e)}")
-        return None
+        st.error(f"Speech generation error: {e}")
+        return None, None
 
+def audio_to_bytes(audio_data, sample_rate):
+    """Convert audio numpy array to bytes."""
+    buffer = BytesIO()
+    sf.write(buffer, audio_data, sample_rate, format='WAV')
+    buffer.seek(0)
+    return buffer.getvalue()
 
-# ===========================
-# Main Application
-# ===========================
+# Main UI
+st.title("🎙️ Voice-to-Text & Text-to-Voice Application")
+st.markdown("Convert speech to text and text to speech using free, open-source AI models.")
 
-def main():
-    # Page configuration
-    st.set_page_config(
-        page_title="Voice-Text Converter",
-        page_icon="🎙️",
-        layout="centered"
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Settings")
+    st.info("**Models Used:**\n- Speech-to-Text: Whisper Tiny\n- Text-to-Speech: Facebook MMS TTS")
+    
+    st.markdown("---")
+    st.markdown("### 📋 Instructions")
+    st.markdown("""
+    **Voice-to-Text:**
+    1. Click the microphone to record
+    2. Speak clearly
+    3. Click again to stop
+    4. View transcription below
+    
+    **Text-to-Voice:**
+    1. Enter or paste text
+    2. Click 'Generate Speech'
+    3. Listen to the audio
+    4. Download if needed
+    """)
+
+# Create two columns for the main functionality
+col1, col2 = st.columns(2)
+
+# ===== VOICE-TO-TEXT SECTION =====
+with col1:
+    st.header("🎤 Voice-to-Text")
+    st.markdown("Record your voice and get the text transcription.")
+    
+    # Audio recorder
+    audio_bytes = audio_recorder(
+        text="Click to record",
+        recording_color="#e74c3c",
+        neutral_color="#3498db",
+        icon_name="microphone",
+        icon_size="2x"
     )
     
-    # Title and description
-    st.title("🎙️ Voice-Text Converter App")
-    st.markdown("""
-    Convert between voice and text seamlessly using AI models.
-    - **Voice to Text**: Upload audio files and get text transcriptions
-    - **Text to Voice**: Enter text and generate natural speech
-    """)
-    
-    # Sidebar with information
-    with st.sidebar:
-        st.header("ℹ️ Information")
-        st.markdown("""
-        **Supported Audio Formats:**
-        - WAV, MP3, OGG
-        
-        **Limitations:**
-        - Max audio size: 10MB
-        - Max text length: 1000 characters
-        
-        **Models Used:**
-        - STT: OpenAI Whisper Tiny
-        - TTS: Microsoft SpeechT5
-        """)
-        
-        st.markdown("---")
-        st.markdown("**Note:** Models will download on first use and are cached for subsequent runs.")
-    
-    # Create tabs for different functionalities
-    tab1, tab2 = st.tabs(["🎤 Voice to Text", "🔊 Text to Voice"])
-    
-    # ===========================
-    # Voice to Text Tab
-    # ===========================
-    with tab1:
-        st.header("Voice to Text (Speech-to-Text)")
-        st.markdown("Upload an audio file to transcribe it to text.")
-        
-        # File uploader
-        audio_file = st.file_uploader(
-            "Upload Audio File",
-            type=['wav', 'mp3', 'ogg'],
-            help="Supported formats: WAV, MP3, OGG (Max size: 10MB)"
-        )
-        
-        # Check file size
-        if audio_file is not None:
-            file_size_mb = len(audio_file.getvalue()) / (1024 * 1024)
-            if file_size_mb > MAX_AUDIO_SIZE_MB:
-                st.error(f"File size ({file_size_mb:.2f} MB) exceeds the maximum limit of {MAX_AUDIO_SIZE_MB} MB.")
-                audio_file = None
+    if audio_bytes:
+        st.session_state.recorded_audio = audio_bytes
+        st.audio(audio_bytes, format="audio/wav")
         
         # Transcribe button
-        if st.button("Transcribe", key="transcribe_btn", disabled=(audio_file is None)):
-            # Load STT model
-            stt_pipe = load_stt_model()
-            
-            if stt_pipe is not None:
-                # Transcribe audio
-                transcribed_text = transcribe_audio(audio_file, stt_pipe)
-                
-                if transcribed_text:
-                    st.success("Transcription completed!")
-                    
-                    # Display transcribed text
-                    st.text_area(
-                        "Transcribed Text",
-                        value=transcribed_text,
-                        height=200,
-                        key="transcribed_output"
-                    )
-                    
-                    # Download button for text
-                    st.download_button(
-                        label="📥 Download Transcription",
-                        data=transcribed_text,
-                        file_name="transcribed_text.txt",
-                        mime="text/plain"
-                    )
+        if st.button("🔄 Transcribe Audio", key="transcribe_btn"):
+            stt_model = load_speech_to_text_model()
+            if stt_model:
+                transcription = transcribe_audio(audio_bytes, stt_model)
+                if transcription:
+                    st.session_state.transcribed_text = transcription
     
-    # ===========================
-    # Text to Voice Tab
-    # ===========================
-    with tab2:
-        st.header("Text to Voice (Text-to-Speech)")
-        st.markdown("Enter text and generate natural-sounding speech.")
-        
-        # Text input
-        input_text = st.text_area(
-            "Enter Text to Convert",
+    # Display transcription
+    if st.session_state.transcribed_text:
+        st.markdown("### 📝 Transcription:")
+        transcribed = st.text_area(
+            "Edit transcription if needed:",
+            value=st.session_state.transcribed_text,
             height=150,
-            max_chars=MAX_TEXT_LENGTH,
-            help=f"Maximum {MAX_TEXT_LENGTH} characters"
+            key="transcription_display"
         )
         
-        # Character count
-        char_count = len(input_text)
-        st.caption(f"Characters: {char_count}/{MAX_TEXT_LENGTH}")
-        
-        # Validate input
-        is_valid_input = len(input_text.strip()) > 0
-        
-        if not is_valid_input and char_count > 0:
-            st.warning("Please enter some text to convert.")
-        
-        # Generate button
-        if st.button("Generate Audio", key="generate_btn", disabled=(not is_valid_input)):
-            # Load TTS model
-            processor, model, vocoder, speaker_embeddings = load_tts_model()
-            
-            if all([processor, model, vocoder, speaker_embeddings is not None]):
-                # Generate audio
-                audio_path = generate_tts(
-                    input_text,
-                    processor,
-                    model,
-                    vocoder,
-                    speaker_embeddings
+        # Download buttons
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            st.download_button(
+                label="⬇️ Download Text",
+                data=transcribed,
+                file_name="transcription.txt",
+                mime="text/plain"
+            )
+        with col_dl2:
+            if st.session_state.recorded_audio:
+                st.download_button(
+                    label="⬇️ Download Audio",
+                    data=st.session_state.recorded_audio,
+                    file_name="recording.wav",
+                    mime="audio/wav"
                 )
-                
-                if audio_path:
-                    st.success("Audio generated successfully!")
-                    
-                    # Play audio
-                    with open(audio_path, 'rb') as audio_file:
-                        audio_bytes = audio_file.read()
-                        st.audio(audio_bytes, format='audio/wav')
-                        
-                        # Download button for audio
-                        st.download_button(
-                            label="📥 Download Audio",
-                            data=audio_bytes,
-                            file_name="generated_audio.wav",
-                            mime="audio/wav"
-                        )
-                    
-                    # Clean up temporary file
-                    try:
-                        os.unlink(audio_path)
-                    except:
-                        pass
+        
+        if st.button("🗑️ Clear Transcription", key="clear_transcription"):
+            st.session_state.transcribed_text = ""
+            st.session_state.recorded_audio = None
+            st.rerun()
 
+# ===== TEXT-TO-VOICE SECTION =====
+with col2:
+    st.header("🔊 Text-to-Voice")
+    st.markdown("Enter text and convert it to speech.")
+    
+    # Text input
+    text_input = st.text_area(
+        "Enter text to convert to speech:",
+        height=150,
+        placeholder="Type your text here...",
+        help="Enter the text you want to convert to speech"
+    )
+    
+    # Generate speech button
+    if st.button("🎵 Generate Speech", key="generate_btn", disabled=not text_input):
+        if text_input.strip():
+            processor, model = load_text_to_speech_model()
+            if processor and model:
+                audio_data, sample_rate = generate_speech(text_input, processor, model)
+                if audio_data is not None:
+                    st.session_state.generated_audio = {
+                        'data': audio_data,
+                        'rate': sample_rate
+                    }
+        else:
+            st.warning("Please enter some text first!")
+    
+    # Display generated audio
+    if st.session_state.generated_audio:
+        st.markdown("### 🎧 Generated Audio:")
+        audio_bytes = audio_to_bytes(
+            st.session_state.generated_audio['data'],
+            st.session_state.generated_audio['rate']
+        )
+        st.audio(audio_bytes, format="audio/wav")
+        
+        # Download button
+        st.download_button(
+            label="⬇️ Download Audio",
+            data=audio_bytes,
+            file_name="generated_speech.wav",
+            mime="audio/wav"
+        )
+        
+        if st.button("🗑️ Clear Audio", key="clear_audio"):
+            st.session_state.generated_audio = None
+            st.rerun()
 
-if __name__ == "__main__":
-    main()
+# Footer
+st.markdown("---")
+st.markdown(
+    """
+    <div style='text-align: center'>
+        <p>Built with Streamlit | Models: OpenAI Whisper & Facebook MMS TTS</p>
+        <p style='font-size: 0.8em; color: gray;'>All processing is done locally - no data is stored</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
