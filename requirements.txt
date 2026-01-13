@@ -1,1 +1,7 @@
-
+streamlit
+transformers
+torch
+torchaudio
+soundfile
+librosa
+datasets
