@@ -1,7 +1,7 @@
 streamlit
 transformers
 torch
-torchaudio
 soundfile
-librosa
-datasets
+numpy
+audio-recorder-streamlit
+accelerate
